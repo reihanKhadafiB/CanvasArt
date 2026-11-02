@@ -32,6 +32,20 @@ import { CanvasSizeModal } from './components/CanvasSizeModal'
 import { AboutModal } from './components/AboutModal'
 import { ExportModal } from './components/ExportModal'
 import { CameraModal } from './components/CameraModal'
+import { LayersPanel } from './components/LayersPanel'
+import { TopBar } from './components/TopBar'
+import { ToolRail } from './components/ToolRail'
+import { calculateObjectSnap } from './renderer/snap'
+import {
+  Sparkles,
+  Type as TypeIcon,
+  Shapes,
+  Palette,
+  Sliders,
+  ZoomIn,
+  ZoomOut,
+  Maximize2,
+} from 'lucide-react'
 
 FabricObject.customProperties = CANVAS_ART_CUSTOM_PROPERTIES
 installStyledObjectRenderers()
@@ -140,7 +154,7 @@ function App() {
   })
   const [showFavoriteStickersOnly, setShowFavoriteStickersOnly] = useState(false)
   const [previewMode, setPreviewMode] = useState(false)
-  const [exportFormat, setExportFormat] = useState<'png' | 'jpeg'>('png')
+  const [exportFormat, setExportFormat] = useState<'png' | 'jpeg' | 'svg'>('png')
   const [exportScale, setExportScale] = useState(1)
   const [exportCustomDimensions, setExportCustomDimensions] = useState(false)
   const [exportCustomWidth, setExportCustomWidth] = useState(1080)
@@ -289,8 +303,8 @@ function App() {
     })
     canvas.on('object:moving', (event) => {
       if (!snapEnabled.current || !event.target) return
-      const spacing = snapSpacing.current
-      event.target.set({ left: Math.round((event.target.left || 0) / spacing) * spacing, top: Math.round((event.target.top || 0) / spacing) * spacing })
+      const { left, top } = calculateObjectSnap(event.target, canvas, grid, snap, snapSpacing.current)
+      event.target.set({ left, top })
     })
     const pointOnImage = (image: FabricImage, scene: { x: number; y: number }) => {
       const [a, b, c, d, e, f] = image.calcTransformMatrix()
@@ -1495,6 +1509,22 @@ function App() {
   const toggleLayerCheck = (object: FabricObject) => {
     setCheckedLayers((current) => current.includes(object) ? current.filter((item) => item !== object) : [...current, object])
   }
+  const toggleLayerVisibility = (object: FabricObject) => {
+    const attrs = object as FabricObject & { visible?: boolean }
+    attrs.visible = attrs.visible === false
+    object.set('visible', attrs.visible)
+    editor.current?.requestRenderAll()
+    syncObjects()
+    commit()
+  }
+  const toggleLayerLock = (object: FabricObject) => {
+    const attrs = object as FabricObject & { selectable?: boolean }
+    const nextSelectable = attrs.selectable === false
+    object.set('selectable', nextSelectable)
+    object.set('evented', nextSelectable)
+    syncObjects()
+    commit()
+  }
   const groupCheckedLayers = () => {
     const canvas = editor.current
     const ordered = canvas?.getObjects().filter((object) => checkedLayers.includes(object)) || []
@@ -1775,6 +1805,12 @@ function App() {
   const renderExportBlob = useCallback(async () => {
     const canvas = editor.current
     if (!canvas) throw new Error('Kanvas editor belum siap')
+
+    if (exportFormat === 'svg') {
+      const svgString = canvas.toSVG({ suppressPreamble: false })
+      return new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' })
+    }
+
     const source = new Image()
     const targetWidth = exportCustomDimensions ? Math.max(16, Math.min(8192, Math.round(exportCustomWidth))) : Math.round(canvas.getWidth() * exportScale)
     const targetHeight = exportCustomDimensions ? Math.max(16, Math.min(8192, Math.round(exportCustomHeight))) : Math.round(canvas.getHeight() * exportScale)
@@ -1818,7 +1854,7 @@ function App() {
   const exportImage = async (share = false) => {
     try {
     const blob = await renderExportBlob()
-    const mimeType = exportFormat === 'jpeg' ? 'image/jpeg' : 'image/png'
+    const mimeType = exportFormat === 'jpeg' ? 'image/jpeg' : exportFormat === 'svg' ? 'image/svg+xml' : 'image/png'
     const filename = `${projectName.replace(/[^a-z0-9-_ ]/gi, '').replaceAll(' ', '-')}.${exportFormat}`
     if (share) {
       const file = new File([blob], filename, { type: mimeType })
@@ -2060,49 +2096,57 @@ function App() {
 
   return (
     <div className={`app-shell ${previewMode ? 'preview-mode' : ''}`}>
-      <header className="topbar">
-        <div className="brand"><div className="brand-mark">C</div><span>Canvas<span className="brand-accent">Art</span></span><span className="beta-tag">LOCAL</span></div>
-        <div className="project-title"><input value={projectName} onChange={(e) => setProjectName(e.target.value)} aria-label="Nama proyek" /><span className="save-state"><i />{status}</span></div>
-        <div className="top-actions">
-          <button className="quiet-btn" onClick={() => setShowAddMenu(true)}><span aria-hidden="true">＋</span> Tambah</button>
-          <button className="icon-btn" title="Undo" onClick={() => void undo()}>↶</button>
-          <button className="icon-btn" title="Redo" onClick={() => void redo()}>↷</button>
-          <span className="toolbar-divider" />
-          <button className="quiet-btn" onClick={() => document.getElementById('open-project')?.click()}>Buka proyek</button>
-          <input id="open-project" className="hidden-input" type="file" accept=".canvasart,.zip" onChange={(e) => void openProject(e.target.files?.[0])} />
-          <button className="quiet-btn" onClick={() => void saveProject()}>Simpan proyek</button>
-          <button className="quiet-btn share-btn" title="Bagikan gambar" onClick={() => void exportImage(true)}>Bagikan</button>
-          <button className="primary-btn" onClick={() => { setExportCustomWidth(canvasWidth); setExportCustomHeight(canvasHeight); setExportCustomDimensions(false); setShowExport(true) }}><span>↓</span> Ekspor</button>
-          <button className="more-btn" title="Menu" onClick={() => setShowMenu(true)}>•••</button>
-        </div>
-      </header>
+      <TopBar
+        projectName={projectName}
+        setProjectName={setProjectName}
+        status={status}
+        onShowAddMenu={() => setShowAddMenu(true)}
+        onUndo={() => void undo()}
+        onRedo={() => void redo()}
+        onOpenProjectClick={() => document.getElementById('open-project')?.click()}
+        onOpenProjectFile={(file) => void openProject(file)}
+        onSaveProject={() => void saveProject()}
+        onShare={() => void exportImage(true)}
+        onOpenExport={() => {
+          setExportCustomWidth(canvasWidth)
+          setExportCustomHeight(canvasHeight)
+          setExportCustomDimensions(false)
+          setShowExport(true)
+        }}
+        onShowMenu={() => setShowMenu(true)}
+      />
 
       <main className="main-layout">
-        <aside className="tool-rail">
-          <button className="tool-btn active" title="Pilih" onClick={() => setTool('select')}><span>↖</span><small>Pilih</small></button>
-          <button className="tool-btn" title="Tambah teks" onClick={addText}><span>T</span><small>Teks</small></button>
-          <button className="tool-btn" title="Bentuk" onClick={() => addShape('rect')}><span>▢</span><small>Bentuk</small></button>
-          <button className="tool-btn" title="Gambar" onClick={() => setTool('draw')}><span>✎</span><small>Gambar</small></button>
-          <button className="tool-btn" title="Impor gambar" onClick={() => document.getElementById('import-image')?.click()}><span>▧</span><small>Impor</small></button>
-          <input id="import-image" className="hidden-input" type="file" accept="image/*" onChange={(e) => void addImage(e.target.files?.[0])} />
-          <div className="rail-separator" />
-          <button className={`tool-btn ${grid ? 'active' : ''}`} title="Grid" onClick={() => setGrid(!grid)}><span>▦</span><small>Grid</small></button>
-          <button className={`tool-btn ${snap ? 'active' : ''}`} title="Snap ke grid" onClick={() => setSnap(!snap)}><span>⌁</span><small>Snap</small></button>
-          <div className="rail-spacer" />
-          <button className="tool-btn" title="Pustaka kutipan" onClick={() => setShowQuotes(true)}><span>❞</span><small>Kutipan</small></button>
-          <button className="tool-btn" title="Layer" onClick={() => document.querySelector('.layers-panel')?.scrollIntoView({ behavior: 'smooth' })}><span>▤</span><small>Layer</small></button>
-        </aside>
+        <ToolRail
+          tool={tool}
+          grid={grid}
+          snap={snap}
+          onSetTool={(newTool) => setTool(newTool)}
+          onAddText={addText}
+          onAddShape={(shape) => addShape(shape)}
+          onImportImageClick={() => document.getElementById('import-image')?.click()}
+          onToggleGrid={() => setGrid(!grid)}
+          onToggleSnap={() => setSnap(!snap)}
+          onOpenQuotes={() => setShowQuotes(true)}
+          onScrollToLayers={() => document.querySelector('.layers-panel')?.scrollIntoView({ behavior: 'smooth' })}
+        />
 
         <section className="workspace">
           <div className="workspace-toolbar">
             <div className="crumb"><span>Proyek</span><b>/</b><strong>{projectName}</strong></div>
             <div className="workspace-tools">
-              <button className="mini-btn" title="Perkecil" onClick={() => setZoom(Math.max(25, zoom - 10))}>−</button>
+              <button className="mini-btn" title="Perkecil" onClick={() => setZoom(Math.max(25, zoom - 10))}>
+                <ZoomOut size={14} />
+              </button>
               <span className="zoom-value" title="Ctrl+scroll untuk zoom · Space+drag untuk pan">{zoom}%</span>
-              <button className="mini-btn" title="Perbesar" onClick={() => setZoom(Math.min(500, zoom + 10))}>+</button>
+              <button className="mini-btn" title="Perbesar" onClick={() => setZoom(Math.min(500, zoom + 10))}>
+                <ZoomIn size={14} />
+              </button>
               <span className="toolbar-divider" />
               <button className="mini-btn fit-btn" onClick={fitCanvasToView}>Pas ke layar</button>
-              <button className="mini-btn" title="Pratinjau layar penuh" onClick={() => setPreviewMode(true)}>⛶</button>
+              <button className="mini-btn" title="Pratinjau layar penuh (Esc untuk keluar)" onClick={() => setPreviewMode(true)}>
+                <Maximize2 size={13} />
+              </button>
               {(grid || snap) && <label className="grid-spacing-control">Grid {gridSpacing}px<input aria-label="Jarak grid dan snap" type="range" min="16" max="200" step="4" value={gridSpacing} onChange={(e) => setGridSpacing(Number(e.target.value))} /></label>}
             </div>
           </div>
@@ -2113,7 +2157,24 @@ function App() {
           </div>
           <div className="bottom-dock">
             <nav className="tab-strip" aria-label="Panel editor">
-              {(['Presets', 'Text', 'Object', 'Background', 'Effects'] as Tab[]).map((tab, i) => <button key={tab} className={`tab-button ${activeTab === tab ? 'selected' : ''}`} onClick={() => setActiveTab(tab)}><span>{['◉', 'T', '⬡', '▧', '✦'][i]}</span>{tab === 'Background' ? 'Latar' : tab === 'Effects' ? 'Efek' : tab === 'Object' ? 'Objek' : tab === 'Presets' ? 'Preset' : 'Teks'}</button>)}
+              {(
+                [
+                  { id: 'Presets', label: 'Preset', icon: <Sparkles size={14} /> },
+                  { id: 'Text', label: 'Teks', icon: <TypeIcon size={14} /> },
+                  { id: 'Object', label: 'Objek', icon: <Shapes size={14} /> },
+                  { id: 'Background', label: 'Latar', icon: <Palette size={14} /> },
+                  { id: 'Effects', label: 'Efek', icon: <Sliders size={14} /> },
+                ] as const
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  className={`tab-button ${activeTab === tab.id ? 'selected' : ''}`}
+                  onClick={() => setActiveTab(tab.id as Tab)}
+                >
+                  <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{tab.icon}</span>
+                  {tab.label}
+                </button>
+              ))}
             </nav>
             <div className="tab-content">
               {activeTab === 'Object' && !showEmojiLibrary && <div className="sticker-library quick-controls"><div className="sticker-library-heading"><strong>Stiker ilustrasi · {STICKERS.length}</strong><input type="search" value={emojiSearch} onChange={(e) => setEmojiSearch(e.target.value)} placeholder="Cari stiker…" aria-label="Cari stiker ilustrasi" /></div><div className="sticker-filters"><select aria-label="Kategori stiker" value={stickerCategory} onChange={(e) => setStickerCategory(e.target.value as 'all' | StickerCategory)}><option value="all">Semua kategori</option>{(['Badge','Dekorasi','Ekspresi','Simbol'] as StickerCategory[]).map((category) => <option key={category} value={category}>{category}</option>)}</select><button className={showFavoriteStickersOnly ? 'chip-active' : ''} onClick={() => setShowFavoriteStickersOnly(!showFavoriteStickersOnly)}>★ Favorit</button></div><div className="sticker-grid">{visibleStickers.map((sticker) => <div className="sticker-card" key={sticker.id}><button className="sticker-add" title={'Tambahkan ' + sticker.name} onClick={() => void addVectorSticker(sticker)}><img src={'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(sticker.svg)} alt="" /><span>{sticker.name}</span></button><button className={'sticker-favorite ' + (favoriteStickers.includes(sticker.id) ? 'is-favorite' : '')} aria-label={favoriteStickers.includes(sticker.id) ? 'Hapus ' + sticker.name + ' dari favorit' : 'Favoritkan ' + sticker.name} title="Favorit" onClick={() => toggleStickerFavorite(sticker.id)}>{favoriteStickers.includes(sticker.id) ? '★' : '☆'}</button></div>)}{visibleStickers.length === 0 && <small className="sticker-empty">Tidak ada stiker yang cocok.</small>}</div><small>Aset SVG orisinal, lokal, dan dapat diedit di kanvas.</small></div>}
@@ -2300,28 +2361,24 @@ function App() {
             <section className="property-section"><h3>Transformasi</h3><div className="numeric-grid"><label>X<input type="number" value={Math.round(selected.left || 0)} onChange={(e) => applyToSelected({ left: Number(e.target.value) })} /></label><label>Y<input type="number" value={Math.round(selected.top || 0)} onChange={(e) => applyToSelected({ top: Number(e.target.value) })} /></label><label>Sudut<input type="number" value={Math.round(selected.angle || 0)} onChange={(e) => applyToSelected({ angle: Number(e.target.value) })} /></label><label>Skala<input type="number" step="0.1" value={Number((selected.scaleX || 1).toFixed(1))} onChange={(e) => applyToSelected({ scaleX: Number(e.target.value), scaleY: Number(e.target.value) })} /></label></div><h4 className="relative-position-title">Posisi relatif pada kanvas</h4><div className="relative-position-grid" role="group" aria-label="Posisi relatif pada kanvas">{(['top','center','bottom'] as const).flatMap((vertical) => (['left','center','right'] as const).map((horizontal) => <button key={`${vertical}-${horizontal}`} title={`${vertical === 'top' ? 'Atas' : vertical === 'center' ? 'Tengah' : 'Bawah'} · ${horizontal === 'left' ? 'Kiri' : horizontal === 'center' ? 'Tengah' : 'Kanan'}`} aria-label={`Posisi ${vertical} ${horizontal}`} onClick={() => positionSelectedRelative(horizontal, vertical)}><span className={`position-dot dot-${vertical}-${horizontal}`} /></button>))}</div></section>
             <section className="property-section"><h3>Layer terpilih</h3><div className="layer-actions"><button onClick={duplicateSelected}>Duplikasi</button><button onClick={() => void copySelected()}>Salin</button><button disabled={!clipboardHasObject} onClick={() => void pasteObject()}>Tempel</button><button onClick={() => moveLayer(selected, 'up')}>Naik satu</button><button onClick={() => moveLayer(selected, 'down')}>Turun satu</button><button onClick={() => moveLayerTo(selected, 'front')}>Paling depan</button><button onClick={() => moveLayerTo(selected, 'back')}>Paling belakang</button><button className="danger-text" onClick={deleteSelected}>Hapus</button>{selected.type === 'group' && <button onClick={ungroupSelected}>Bongkar grup</button>}</div></section>
           </div> : <div className="empty-selection"><div className="empty-icon">✦</div><strong>Belum ada objek dipilih</strong><span>Pilih elemen di kanvas atau tambahkan elemen baru.</span><button className="control-chip" onClick={addText}>＋ Tambah teks</button></div>}
-          <div className="layers-panel">
-            <div className="layers-title"><h3>Layers</h3><span>{objects.length}</span><button title="Tambah teks" onClick={addText}>＋</button></div>
-            {checkedLayers.length > 0 && <>
-              <div className="layer-bulk-actions"><span>{checkedLayers.length} dipilih</span><button onClick={deleteCheckedLayers}>Hapus</button><button disabled={checkedLayers.length < 2} onClick={groupCheckedLayers}>Grup</button><button disabled={checkedLayers.length < 2} onClick={() => void mergeCheckedLayers()}>Gabungkan</button></div>
-              <div className="layer-align-actions">
-                <button onClick={() => alignCheckedLayers('left')}>Kiri</button><button onClick={() => alignCheckedLayers('centerX')}>Tengah X</button><button onClick={() => alignCheckedLayers('right')}>Kanan</button>
-                <button onClick={() => alignCheckedLayers('top')}>Atas</button><button onClick={() => alignCheckedLayers('centerY')}>Tengah Y</button><button onClick={() => alignCheckedLayers('bottom')}>Bawah</button>
-                <button disabled={checkedLayers.length < 3} onClick={() => alignCheckedLayers('distributeX')}>Sebar X</button><button disabled={checkedLayers.length < 3} onClick={() => alignCheckedLayers('distributeY')}>Sebar Y</button>
-              </div>
-            </>}
-            <div className="layer-list">{[...objects].reverse().map((object, reverseIndex) => {
-              const index = objects.length - reverseIndex - 1
-              const attrs = object as FabricObject & { name?: string; visible?: boolean; selectable?: boolean }
-              return <div className={`layer-row ${selected === object ? 'layer-selected' : ''}`} key={String((object as FabricObject & { id?: string }).id || index)} onClick={() => { editor.current?.setActiveObject(object); syncObjects() }}>
-                <input className="layer-check" type="checkbox" aria-label={`Pilih layer ${getObjectName(object, index)}`} checked={checkedLayers.includes(object)} onClick={(e) => e.stopPropagation()} onChange={() => toggleLayerCheck(object)} />
-                <span className="layer-type">{object.type === 'i-text' || object.type === 'text' || object.type === 'textbox' ? 'T' : object.type === 'image' ? '▧' : '◇'}</span>
-                <input aria-label="Nama layer" value={getObjectName(object, index)} onClick={(e) => e.stopPropagation()} onChange={(e) => renameLayer(object, e.target.value)} />
-                <button title={attrs.visible === false ? 'Tampilkan' : 'Sembunyikan'} onClick={(e) => { e.stopPropagation(); attrs.visible = attrs.visible === false; object.set('visible', attrs.visible); editor.current?.requestRenderAll(); syncObjects(); commit() }}>{attrs.visible === false ? '○' : '◉'}</button>
-                <button title="Kunci/buka" onClick={(e) => { e.stopPropagation(); object.set('selectable', attrs.selectable === false); object.set('evented', attrs.selectable === false); syncObjects(); commit() }}>{attrs.selectable === false ? '▣' : '⌑'}</button>
-              </div>
-            })}{!objects.length && <div className="layers-empty">Objek akan muncul di sini</div>}</div>
-          </div>
+          <LayersPanel
+            objects={objects}
+            selected={selected}
+            checkedLayers={checkedLayers}
+            onSelectObject={(obj) => {
+              editor.current?.setActiveObject(obj)
+              syncObjects()
+            }}
+            onAddText={addText}
+            onToggleCheck={toggleLayerCheck}
+            onRenameLayer={renameLayer}
+            onToggleVisibility={toggleLayerVisibility}
+            onToggleLock={toggleLayerLock}
+            onDeleteChecked={deleteCheckedLayers}
+            onGroupChecked={groupCheckedLayers}
+            onMergeChecked={() => void mergeCheckedLayers()}
+            onAlignChecked={alignCheckedLayers}
+          />
         </aside>
       </main>
 
