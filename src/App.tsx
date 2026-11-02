@@ -1,536 +1,40 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
-import { Canvas, Circle, Ellipse, FabricImage, FabricObject, FabricText, Gradient, Group, Path as FabricPath, Pattern, PencilBrush, Point, Polygon, Rect, Triangle, filters } from 'fabric'
+import { ActiveSelection, Canvas, Circle, Ellipse, FabricImage, FabricObject, FabricText, Gradient, Group, Path as FabricPath, Pattern, PencilBrush, Point, Polygon, Rect, Triangle, filters } from 'fabric'
 import JSZip from 'jszip'
 import { createProject, parseProject } from './document'
-import type { BrushSettings, CanvasArtProject, FontAsset, TextStyleAsset } from './document'
-import { QUOTES } from './quotes'
-import type { QuoteCategory, QuoteEntry, QuoteLanguage } from './quotes'
+import type { CanvasArtProject, FontAsset } from './document'
+import type { QuoteEntry } from './quotes'
 import { STICKERS } from './stickers'
 import type { StickerCategory, StickerAsset } from './stickers'
 import './App.css'
 
-type Tab = 'Presets' | 'Text' | 'Object' | 'Background' | 'Effects'
-type BezierPoint = { x: number; y: number; handleIn?: { x: number; y: number }; handleOut?: { x: number; y: number } }
-type PerspectiveCorner = { x: number; y: number }
-type BezierEditDrag = { index: number; handle: 'anchor' | 'in' | 'out' }
-type SavedTextStyle = TextStyleAsset
-function transformBezierPoints(path: FabricPath, points: BezierPoint[]): BezierPoint[] {
-  const [a, b, c, d, e, f] = path.calcTransformMatrix()
-  const offset = path.pathOffset || new Point(0, 0)
-  return points.map((point) => ({
-    x: a * (point.x - offset.x) + c * (point.y - offset.y) + e,
-    y: b * (point.x - offset.x) + d * (point.y - offset.y) + f,
-    ...(point.handleIn ? { handleIn: { x: a * point.handleIn.x + c * point.handleIn.y, y: b * point.handleIn.x + d * point.handleIn.y } } : {}),
-    ...(point.handleOut ? { handleOut: { x: a * point.handleOut.x + c * point.handleOut.y, y: b * point.handleOut.x + d * point.handleOut.y } } : {}),
-  }))
-}
-function bezierPathData(points: BezierPoint[], closed = false) {
-  if (!points.length) return ''
-  const commands = [`M ${points[0].x} ${points[0].y}`]
-  for (let i = 0; i < points.length - 1; i += 1) {
-    const p0 = points[Math.max(0, i - 1)]
-    const p1 = points[i]
-    const p2 = points[i + 1]
-    const p3 = points[Math.min(points.length - 1, i + 2)]
-    if (points.length === 2 && !p1.handleOut && !p2.handleIn) { commands.push(`L ${p2.x} ${p2.y}`); continue }
-    const autoC1 = { x: p1.x + (p2.x - p0.x) / 6, y: p1.y + (p2.y - p0.y) / 6 }
-    const autoC2 = { x: p2.x - (p3.x - p1.x) / 6, y: p2.y - (p3.y - p1.y) / 6 }
-    const c1 = p1.handleOut ? { x: p1.x + p1.handleOut.x, y: p1.y + p1.handleOut.y } : autoC1
-    const c2 = p2.handleIn ? { x: p2.x + p2.handleIn.x, y: p2.y + p2.handleIn.y } : autoC2
-    commands.push(`C ${c1.x} ${c1.y} ${c2.x} ${c2.y} ${p2.x} ${p2.y}`)
-  }
-  if (closed && points.length > 2) {
-    const last = points[points.length - 1]
-    const first = points[0]
-    if (last.handleOut || first.handleIn) {
-      const c1 = last.handleOut ? { x: last.x + last.handleOut.x, y: last.y + last.handleOut.y } : last
-      const c2 = first.handleIn ? { x: first.x + first.handleIn.x, y: first.y + first.handleIn.y } : first
-      commands.push(`C ${c1.x} ${c1.y} ${c2.x} ${c2.y} ${first.x} ${first.y}`)
-    }
-    commands.push('Z')
-  }
-  return commands.join(' ')
-}
-function getBrushSettings(settings?: Partial<BrushSettings>): BrushSettings {
-  return {
-    color: /^#[\da-f]{6}$/i.test(settings?.color || '') ? settings!.color! : '#202b47',
-    size: Math.max(1, Math.min(60, Number.isFinite(settings?.size) ? settings!.size! : 8)),
-    smooth: Math.max(0, Math.min(8, Number.isFinite(settings?.smooth) ? settings!.smooth! : 0.4)),
-    dashed: Boolean(settings?.dashed),
-  }
-}
-async function syncPathMaskDependents(canvas: Canvas, source: FabricPath & { canvasArtId?: string }) {
-  if (!source.canvasArtId) return
-  const dependents = canvas.getObjects().filter((object) => (object as FabricObject & { canvasArtMaskSourceId?: string }).canvasArtMaskSourceId === source.canvasArtId)
-  for (const target of dependents) {
-    const mode = (target as FabricObject & { canvasArtMaskMode?: 'in' | 'out' }).canvasArtMaskMode || 'in'
-    const clipPath = await source.clone()
-    clipPath.set({ absolutePositioned: true, inverted: mode === 'out', visible: true, selectable: false, evented: false } as never)
-    target.set({ clipPath, dirty: true } as never)
-    target.setCoords()
-  }
-  if (dependents.length) canvas.requestRenderAll()
-}
-function drawPerspectiveTriangle(ctx: CanvasRenderingContext2D, source: HTMLCanvasElement, sourcePoints: PerspectiveCorner[], targetPoints: PerspectiveCorner[]) {
-  const [p0, p1, p2] = sourcePoints
-  const [q0, q1, q2] = targetPoints
-  const denominator = p0.x * (p1.y - p2.y) + p1.x * (p2.y - p0.y) + p2.x * (p0.y - p1.y)
-  if (Math.abs(denominator) < 0.0001) return
-  const solve = (v0: number, v1: number, v2: number) => ({
-    a: (v0 * (p1.y - p2.y) + v1 * (p2.y - p0.y) + v2 * (p0.y - p1.y)) / denominator,
-    c: (v0 * (p2.x - p1.x) + v1 * (p0.x - p2.x) + v2 * (p1.x - p0.x)) / denominator,
-    e: (v0 * (p1.x * p2.y - p2.x * p1.y) + v1 * (p2.x * p0.y - p0.x * p2.y) + v2 * (p0.x * p1.y - p1.x * p0.y)) / denominator,
-  })
-  const x = solve(q0.x, q1.x, q2.x)
-  const y = solve(q0.y, q1.y, q2.y)
-  ctx.save()
-  ctx.beginPath(); ctx.moveTo(q0.x, q0.y); ctx.lineTo(q1.x, q1.y); ctx.lineTo(q2.x, q2.y); ctx.closePath(); ctx.clip()
-  ctx.setTransform(x.a, y.a, x.c, y.c, x.e, y.e)
-  ctx.drawImage(source, 0, 0)
-  ctx.restore()
-}
-function renderPerspectiveWarp(source: HTMLCanvasElement, corners: PerspectiveCorner[]) {
-  const width = source.width
-  const height = source.height
-  const quad = corners.map((point) => ({ x: point.x * width, y: point.y * height }))
-  const minX = Math.floor(Math.min(...quad.map((point) => point.x)))
-  const minY = Math.floor(Math.min(...quad.map((point) => point.y)))
-  const maxX = Math.ceil(Math.max(...quad.map((point) => point.x)))
-  const maxY = Math.ceil(Math.max(...quad.map((point) => point.y)))
-  const output = document.createElement('canvas')
-  output.width = Math.max(1, Math.min(8192, maxX - minX))
-  output.height = Math.max(1, Math.min(8192, maxY - minY))
-  const context = output.getContext('2d')
-  if (!context) throw new Error('Canvas perspektif tidak tersedia')
-  context.imageSmoothingEnabled = true
-  context.imageSmoothingQuality = 'high'
-  const divisions = 24
-  const sourcePoint = (u: number, v: number): PerspectiveCorner => ({ x: u * width, y: v * height })
-  const targetPoint = (u: number, v: number): PerspectiveCorner => ({
-    x: (1 - u) * (1 - v) * quad[0].x + u * (1 - v) * quad[1].x + u * v * quad[2].x + (1 - u) * v * quad[3].x - minX,
-    y: (1 - u) * (1 - v) * quad[0].y + u * (1 - v) * quad[1].y + u * v * quad[2].y + (1 - u) * v * quad[3].y - minY,
-  })
-  for (let row = 0; row < divisions; row += 1) {
-    for (let column = 0; column < divisions; column += 1) {
-      const u0 = column / divisions; const u1 = (column + 1) / divisions
-      const v0 = row / divisions; const v1 = (row + 1) / divisions
-      const s00 = sourcePoint(u0, v0); const s10 = sourcePoint(u1, v0); const s11 = sourcePoint(u1, v1); const s01 = sourcePoint(u0, v1)
-      const t00 = targetPoint(u0, v0); const t10 = targetPoint(u1, v0); const t11 = targetPoint(u1, v1); const t01 = targetPoint(u0, v1)
-      drawPerspectiveTriangle(context, source, [s00, s10, s11], [t00, t10, t11])
-      drawPerspectiveTriangle(context, source, [s00, s11, s01], [t00, t11, t01])
-    }
-  }
-  return { element: output, offsetX: minX, offsetY: minY, sourceWidth: width, sourceHeight: height }
-}
-function graphemeCount(text: string) {
-  return typeof Intl.Segmenter === 'function'
-    ? Array.from(new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text)).length
-    : Array.from(text).length
-}
-const EMOJI_STICKERS = ['😀','😃','😄','😁','😆','😂','🤣','😊','😎','😍','🥰','😘','😜','🤔','😴','😭','😡','🤯','🥳','🤩','😇','🤗','🤫','🤭','😱','😈','💀','👻','🤖','👽','💩','❤️','🧡','💛','💚','💙','💜','🖤','🤍','💔','✨','⭐','🌟','🔥','💥','⚡','☀️','🌈','☁️','❄️','🌸','🌺','🌻','🍀','🌴','🍉','🍓','🍕','🎂','🎉','🎊','🎁','🏆','👑','💎','🚀','✈️','🚗','⚽','🏀','🎨','🎵','💯','✅','❌','❗','❓','💡','📌','🔔','👍','👎','👏','🙌','🙏','💪','👋','✌️','🤟','🫶','🎯','🚩']
+import type { Tab, BezierPoint, PerspectiveCorner, BezierEditDrag, SavedTextStyle } from './types'
+import { EMOJI_STICKERS, CANVAS_ART_CUSTOM_PROPERTIES } from './constants'
+import { graphemeCount } from './utils/text'
+import { download, readFileAsDataUrl } from './utils/file'
+import { getBrushSettings } from './utils/brush'
+import { getObjectName } from './utils/object'
+import { saveLocal, readLocal, DB_NAME, DB_STORE, AUTOSAVE_ID } from './services/storage'
+import { installFontAssets } from './services/font'
+import { transformBezierPoints, bezierPathData } from './renderer/bezier'
+import { renderPerspectiveWarp } from './renderer/perspective'
+import {
+  installStyledObjectRenderers,
+  syncPathMaskDependents,
+  type ExtrudedText,
+  type BackgroundStyledText,
+  type WordSpacedText,
+  type StyledCanvasObject,
+} from './renderer/styledObjects'
+import { QuotesModal } from './components/QuotesModal'
+import { CanvasSizeModal } from './components/CanvasSizeModal'
+import { AboutModal } from './components/AboutModal'
+import { ExportModal } from './components/ExportModal'
+import { CameraModal } from './components/CameraModal'
 
-const DB_NAME = 'canvasart-local'
-const DB_STORE = 'projects'
-const AUTOSAVE_ID = 'autosave'
-FabricObject.customProperties = ['canvasArtBezierPoints', 'canvasArtBezierClosed', 'name', 'canvasArtCurve', 'canvasArtWordSpacing', 'canvasArtBackgroundPaddingLeft', 'canvasArtBackgroundPaddingRight', 'canvasArtBackgroundPaddingTop', 'canvasArtBackgroundPaddingBottom', 'canvasArtBackgroundRadius', 'canvasArt3DDepth', 'canvasArt3DAngle', 'canvasArt3DColor', 'canvasArt3DMode', 'canvasArt3DDarken', 'canvasArt3DLightEnabled', 'canvasArt3DLightAngle', 'canvasArt3DLightIntensity', 'canvasArt3DAmbientLight', 'canvasArt3DRotateX', 'canvasArt3DRotateY', 'canvasArt3DBaseScaleX', 'canvasArt3DBaseScaleY', 'canvasArtMaskEnabled', 'canvasArtMaskShape', 'canvasArtMaskMode', 'canvasArtMaskScaleX', 'canvasArtMaskScaleY', 'canvasArtMaskSourceId', 'canvasArtMaskSourceVisible', 'canvasArtId', 'canvasArtWarpSourceId', 'canvasArtWarpSourceVisible', 'canvasArtWarpSourceSelectable', 'canvasArtWarpCorners', 'canvasArtArrowLength', 'canvasArtArrowThickness', 'canvasArtArrowHead', 'canvasArtArrowTail', 'canvasArtInnerShadowEnabled', 'canvasArtInnerShadowColor', 'canvasArtInnerShadowBlur', 'canvasArtInnerShadowOffsetX', 'canvasArtInnerShadowOffsetY', 'canvasArtInnerShadowOpacity', 'canvasArtReflectionEnabled', 'canvasArtReflectionGap', 'canvasArtReflectionLength', 'canvasArtReflectionOpacity', 'canvasArt3DShadowEnabled', 'canvasArt3DShadowColor', 'canvasArt3DShadowAngle', 'canvasArt3DShadowLength', 'canvasArt3DShadowGap', 'canvasArt3DShadowBlur', 'canvasArt3DShadowOpacity', 'canvasArtEmbossEnabled', 'canvasArtEmbossAngle', 'canvasArtEmbossIntensity', 'canvasArtEmbossAmbient', 'canvasArtEmbossHardness', 'canvasArtEmbossBevel']
-
-type BackgroundStyledText = {
-  textBackgroundColor?: string
-  path?: unknown
-  width: number
-  direction: string
-  canvasArtBackgroundPaddingLeft?: number
-  canvasArtBackgroundPaddingRight?: number
-  canvasArtBackgroundPaddingTop?: number
-  canvasArtBackgroundPaddingBottom?: number
-  canvasArtBackgroundRadius?: number
-  _getLeftOffset(): number
-  _getTopOffset(): number
-  _getLineLeftOffset(lineIndex: number): number
-  _textLines: string[][]
-  getHeightOfLine(lineIndex: number): number
-  getLineWidth(lineIndex: number): number
-}
-const textPrototype = FabricText.prototype as unknown as Record<string, unknown>
-type WordSpacedText = FabricText & { canvasArtWordSpacing?: number }
-type GraphemeBoxLike = { width: number; kernedWidth: number; [key: string]: unknown }
-const nativeGetGraphemeBox = textPrototype._getGraphemeBox as (this: FabricText, grapheme: string, lineIndex: number, charIndex: number, previous?: string, skipLeft?: boolean) => GraphemeBoxLike
-textPrototype._getGraphemeBox = function (this: FabricText, grapheme: string, lineIndex: number, charIndex: number, previous?: string, skipLeft?: boolean) {
-  const box = nativeGetGraphemeBox.call(this, grapheme, lineIndex, charIndex, previous, skipLeft)
-  const spacing = grapheme === ' ' ? Math.max(-100, Math.min(500, (this as WordSpacedText).canvasArtWordSpacing || 0)) : 0
-  return spacing ? { ...box, width: box.width + spacing, kernedWidth: box.kernedWidth + spacing } : box
-}
-const renderNativeTextBackground = textPrototype._renderTextLinesBackground as (this: FabricText, ctx: CanvasRenderingContext2D) => void
-textPrototype._renderTextLinesBackground = function (this: FabricText, ctx: CanvasRenderingContext2D) {
-  const text = this as unknown as BackgroundStyledText
-  const padLeft = Math.max(0, text.canvasArtBackgroundPaddingLeft || 0)
-  const padRight = Math.max(0, text.canvasArtBackgroundPaddingRight || 0)
-  const padTop = Math.max(0, text.canvasArtBackgroundPaddingTop || 0)
-  const padBottom = Math.max(0, text.canvasArtBackgroundPaddingBottom || 0)
-  const radius = Math.max(0, text.canvasArtBackgroundRadius || 0)
-  if (!renderNativeTextBackground || !text.textBackgroundColor || text.path || !(padLeft || padRight || padTop || padBottom || radius)) {
-    renderNativeTextBackground?.call(this, ctx)
-    return
-  }
-  const originalFill = ctx.fillStyle
-  ctx.fillStyle = text.textBackgroundColor
-  let lineTop = text._getTopOffset()
-  for (let index = 0; index < text._textLines.length; index += 1) {
-    const lineHeight = text.getHeightOfLine(index)
-    const lineWidth = text.getLineWidth(index)
-    let left = text._getLeftOffset() + text._getLineLeftOffset(index)
-    if (text.direction === 'rtl') left = text.width - left - lineWidth
-    const x = left - padLeft
-    const y = lineTop - padTop
-    const width = lineWidth + padLeft + padRight
-    const height = lineHeight + padTop + padBottom
-    const corner = Math.min(radius, width / 2, height / 2)
-    ctx.beginPath()
-    if (typeof ctx.roundRect === 'function') ctx.roundRect(x, y, width, height, corner)
-    else {
-      ctx.moveTo(x + corner, y)
-      ctx.lineTo(x + width - corner, y)
-      ctx.quadraticCurveTo(x + width, y, x + width, y + corner)
-      ctx.lineTo(x + width, y + height - corner)
-      ctx.quadraticCurveTo(x + width, y + height, x + width - corner, y + height)
-      ctx.lineTo(x + corner, y + height)
-      ctx.quadraticCurveTo(x, y + height, x, y + height - corner)
-      ctx.lineTo(x, y + corner)
-      ctx.quadraticCurveTo(x, y, x + corner, y)
-    }
-    ctx.closePath()
-    ctx.fill()
-    lineTop += text.getHeightOfLine(index)
-  }
-  const fill = text.textBackgroundColor
-  text.textBackgroundColor = ''
-  try { renderNativeTextBackground.call(this, ctx) } finally { text.textBackgroundColor = fill }
-  ctx.fillStyle = originalFill
-}
-type ExtrudedText = FabricText & { canvasArt3DDepth?: number; canvasArt3DAngle?: number; canvasArt3DColor?: string; canvasArt3DMode?: 'oblique' | 'perspective'; canvasArt3DDarken?: number; canvasArt3DLightEnabled?: boolean; canvasArt3DLightAngle?: number; canvasArt3DLightIntensity?: number; canvasArt3DAmbientLight?: number; canvasArt3DRotateX?: number; canvasArt3DRotateY?: number; canvasArt3DBaseScaleX?: number; canvasArt3DBaseScaleY?: number; canvasArtInnerShadowEnabled?: boolean; canvasArtInnerShadowColor?: string; canvasArtInnerShadowBlur?: number; canvasArtInnerShadowOffsetX?: number; canvasArtInnerShadowOffsetY?: number; canvasArtInnerShadowOpacity?: number; canvasArtReflectionEnabled?: boolean; canvasArtReflectionGap?: number; canvasArtReflectionLength?: number; canvasArtReflectionOpacity?: number; canvasArt3DShadowEnabled?: boolean; canvasArt3DShadowColor?: string; canvasArt3DShadowAngle?: number; canvasArt3DShadowLength?: number; canvasArt3DShadowGap?: number; canvasArt3DShadowBlur?: number; canvasArt3DShadowOpacity?: number; canvasArtEmbossEnabled?: boolean; canvasArtEmbossAngle?: number; canvasArtEmbossIntensity?: number; canvasArtEmbossAmbient?: number; canvasArtEmbossHardness?: number; canvasArtEmbossBevel?: number; textBackgroundColor?: string }
-function darkenHexColor(color: string, amount: number) {
-  const match = /^#([\da-f]{6})$/i.exec(color)
-  if (!match) return color
-  const factor = 1 - Math.max(0, Math.min(100, amount)) / 100
-  const channels = [0, 2, 4].map((index) => Math.round(parseInt(match[1].slice(index, index + 2), 16) * factor))
-  return `#${channels.map((channel) => channel.toString(16).padStart(2, '0')).join('')}`
-}
-function lightHexColor(color: string, amount: number) {
-  const match = /^#([\da-f]{6})$/i.exec(color)
-  if (!match) return color
-  const factor = Math.max(0, Math.min(1.5, amount))
-  const channels = [0, 2, 4].map((index) => {
-    const value = parseInt(match[1].slice(index, index + 2), 16)
-    return Math.round(factor <= 1 ? value * factor : value + (255 - value) * (factor - 1) * 2)
-  })
-  return `#${channels.map((channel) => Math.max(0, Math.min(255, channel)).toString(16).padStart(2, '0')).join('')}`
-}
-const renderNativeText = textPrototype._render as (this: FabricText, ctx: CanvasRenderingContext2D) => void
-function renderInnerTextShadow(text: FabricText, ctx: CanvasRenderingContext2D) {
-  const styled = text as ExtrudedText
-  if (!styled.canvasArtInnerShadowEnabled) return
-  const blur = Math.max(0, Math.min(48, styled.canvasArtInnerShadowBlur || 0))
-  const offsetX = Math.max(-80, Math.min(80, styled.canvasArtInnerShadowOffsetX || 0))
-  const offsetY = Math.max(-80, Math.min(80, styled.canvasArtInnerShadowOffsetY || 0))
-  const margin = Math.ceil(blur * 2 + Math.max(Math.abs(offsetX), Math.abs(offsetY)) + 4)
-  const width = Math.max(1, Math.ceil(text.width || text.getScaledWidth()))
-  const height = Math.max(1, Math.ceil(text.height || text.getScaledHeight()))
-  const mask = document.createElement('canvas')
-  mask.width = width + margin * 2; mask.height = height + margin * 2
-  const maskContext = mask.getContext('2d')
-  if (!maskContext) return
-  const original = { fill: text.fill, stroke: text.stroke, strokeWidth: text.strokeWidth, shadow: text.shadow, opacity: text.opacity, background: styled.textBackgroundColor }
-  try {
-    text.set({ fill: '#fff', stroke: null, strokeWidth: 0, shadow: null, opacity: 1 } as never)
-    styled.textBackgroundColor = ''
-    maskContext.translate(margin + width / 2, margin + height / 2)
-    renderNativeText.call(text, maskContext)
-  } finally {
-    text.set({ fill: original.fill, stroke: original.stroke, strokeWidth: original.strokeWidth, shadow: original.shadow, opacity: original.opacity } as never)
-    styled.textBackgroundColor = original.background
-  }
-  const shifted = document.createElement('canvas')
-  shifted.width = mask.width; shifted.height = mask.height
-  const shiftedContext = shifted.getContext('2d')
-  if (!shiftedContext) return
-  shiftedContext.filter = blur ? `blur(${blur}px)` : 'none'
-  shiftedContext.drawImage(mask, offsetX, offsetY)
-  shiftedContext.filter = 'none'
-  const inner = document.createElement('canvas')
-  inner.width = mask.width; inner.height = mask.height
-  const innerContext = inner.getContext('2d')
-  if (!innerContext) return
-  innerContext.fillStyle = styled.canvasArtInnerShadowColor || '#202b47'
-  innerContext.fillRect(0, 0, inner.width, inner.height)
-  innerContext.globalCompositeOperation = 'destination-out'
-  innerContext.drawImage(shifted, 0, 0)
-  innerContext.globalCompositeOperation = 'destination-in'
-  innerContext.drawImage(mask, 0, 0)
-  ctx.save()
-  ctx.globalAlpha = Math.max(0, Math.min(1, styled.canvasArtInnerShadowOpacity ?? 0.7))
-  ctx.drawImage(inner, -width / 2 - margin, -height / 2 - margin)
-  ctx.restore()
-}
-function renderTextEmboss(text: FabricText, ctx: CanvasRenderingContext2D) {
-  const styled = text as ExtrudedText
-  if (!styled.canvasArtEmbossEnabled) return
-  const angle = (styled.canvasArtEmbossAngle || 45) * Math.PI / 180
-  const bevel = Math.max(0.5, Math.min(24, styled.canvasArtEmbossBevel ?? 3))
-  const intensity = Math.max(0, Math.min(1, styled.canvasArtEmbossIntensity ?? 0.65))
-  const ambient = Math.max(0, Math.min(1, styled.canvasArtEmbossAmbient ?? 0.2))
-  const hardness = Math.max(0, Math.min(1, styled.canvasArtEmbossHardness ?? 0.7))
-  const distance = bevel * 0.55
-  const original = { fill: text.fill, stroke: text.stroke, strokeWidth: text.strokeWidth, shadow: text.shadow }
-  ctx.save()
-  try {
-    ctx.filter = hardness >= 0.99 ? 'none' : `blur(${((1 - hardness) * bevel) / 5}px)`
-    ctx.globalAlpha *= Math.min(1, intensity + ambient * 0.25)
-    text.set({ fill: 'rgba(0,0,0,0)', stroke: '#ffffff', strokeWidth: bevel, shadow: null } as never)
-    ctx.save(); ctx.translate(-Math.cos(angle) * distance, -Math.sin(angle) * distance); renderNativeText.call(text, ctx); ctx.restore()
-    ctx.globalAlpha *= Math.max(0.25, intensity)
-    text.set({ stroke: '#111827' } as never)
-    ctx.save(); ctx.translate(Math.cos(angle) * distance, Math.sin(angle) * distance); renderNativeText.call(text, ctx); ctx.restore()
-  } finally {
-    text.set({ fill: original.fill, stroke: original.stroke, strokeWidth: original.strokeWidth, shadow: original.shadow } as never)
-    ctx.restore()
-  }
-}
-function renderText3DShadow(text: FabricText, ctx: CanvasRenderingContext2D) {
-  const styled = text as ExtrudedText
-  if (!styled.canvasArt3DShadowEnabled) return
-  const gap = Math.max(0, Math.min(160, styled.canvasArt3DShadowGap || 0))
-  const length = Math.max(0.05, Math.min(0.8, styled.canvasArt3DShadowLength ?? 0.2))
-  const angle = (styled.canvasArt3DShadowAngle || 0) * Math.PI / 180
-  const blur = Math.max(0, Math.min(60, styled.canvasArt3DShadowBlur || 0))
-  const opacity = Math.max(0, Math.min(1, styled.canvasArt3DShadowOpacity ?? 0.45))
-  const height = Math.max(1, text.height || text.getScaledHeight())
-  const original = { fill: text.fill, stroke: text.stroke, strokeWidth: text.strokeWidth, shadow: text.shadow, background: styled.textBackgroundColor }
-  ctx.save()
-  try {
-    ctx.globalAlpha *= opacity
-    ctx.filter = blur ? `blur(${blur}px)` : 'none'
-    ctx.translate(0, height / 2 + gap + height * length / 2)
-    ctx.transform(1, 0, Math.tan(angle) * length, length, 0, 0)
-    text.set({ fill: styled.canvasArt3DShadowColor || '#161a24', stroke: null, strokeWidth: 0, shadow: null } as never)
-    styled.textBackgroundColor = ''
-    renderNativeText.call(text, ctx)
-  } finally {
-    text.set({ fill: original.fill, stroke: original.stroke, strokeWidth: original.strokeWidth, shadow: original.shadow } as never)
-    styled.textBackgroundColor = original.background
-    ctx.restore()
-  }
-}
-function renderTextReflection(text: FabricText, ctx: CanvasRenderingContext2D) {
-  const styled = text as ExtrudedText
-  if (!styled.canvasArtReflectionEnabled) return
-  const gap = Math.max(0, Math.min(120, styled.canvasArtReflectionGap || 0))
-  const length = Math.max(0.1, Math.min(1.5, styled.canvasArtReflectionLength ?? 0.65))
-  const opacity = Math.max(0, Math.min(1, styled.canvasArtReflectionOpacity ?? 0.35))
-  const height = Math.max(1, text.height || text.getScaledHeight())
-  const shadow = text.shadow
-  ctx.save()
-  try {
-    ctx.globalAlpha *= opacity
-    ctx.translate(0, height / 2 + gap)
-    ctx.scale(1, -length)
-    text.set({ shadow: null } as never)
-    renderNativeText.call(text, ctx)
-  } finally {
-    text.set({ shadow } as never)
-    ctx.restore()
-  }
-}
-textPrototype._render = function (this: FabricText, ctx: CanvasRenderingContext2D) {
-  if (!renderNativeText) return
-  const text = this as ExtrudedText
-  const depth = Math.max(0, Math.min(32, Math.round(text.canvasArt3DDepth || 0)))
-  if (!depth) { renderText3DShadow(this, ctx); renderTextReflection(this, ctx); renderNativeText.call(this, ctx); renderTextEmboss(this, ctx); renderInnerTextShadow(this, ctx); return }
-  renderText3DShadow(this, ctx)
-  renderTextReflection(this, ctx)
-  const original = { fill: this.fill, stroke: this.stroke, strokeWidth: this.strokeWidth, shadow: this.shadow, background: text.textBackgroundColor }
-  const angle = ((text.canvasArt3DAngle || 45) * Math.PI) / 180
-  const stepX = Math.cos(angle)
-  const stepY = Math.sin(angle)
-  try {
-    this.set({ shadow: null } as never)
-    text.textBackgroundColor = ''
-    for (let step = depth; step >= 1; step -= 1) {
-      const perspective = text.canvasArt3DMode === 'perspective' ? 0.45 + 0.55 * (step / depth) : 1
-      ctx.save()
-      ctx.translate(stepX * step * perspective, stepY * step * perspective)
-      let depthColor = darkenHexColor(text.canvasArt3DColor || '#344987', text.canvasArt3DDarken || 0)
-      if (text.canvasArt3DLightEnabled) {
-        const lightAngle = (text.canvasArt3DLightAngle ?? 315) * Math.PI / 180
-        const facing = Math.max(0, Math.cos(lightAngle - (angle + Math.PI / 2)))
-        const intensity = Math.max(0, Math.min(1, text.canvasArt3DLightIntensity ?? 0.75))
-        const ambient = Math.max(0, Math.min(1, text.canvasArt3DAmbientLight ?? 0.22))
-        const illumination = (ambient + intensity * (0.18 + facing * 0.95)) * (0.62 + 0.38 * (step / depth))
-        depthColor = lightHexColor(depthColor, illumination)
-      }
-      this.set({ fill: depthColor, stroke: depthColor, strokeWidth: Math.max(0.5, Number(original.strokeWidth) || 0) } as never)
-      renderNativeText.call(this, ctx)
-      ctx.restore()
-    }
-  } finally {
-    this.set({ fill: original.fill, stroke: original.stroke, strokeWidth: original.strokeWidth, shadow: original.shadow } as never)
-    text.textBackgroundColor = original.background
-  }
-  renderNativeText.call(this, ctx)
-  renderTextEmboss(this, ctx)
-  renderInnerTextShadow(this, ctx)
-}
-
-type StyledCanvasObject = FabricObject & {
-  canvasArtInnerShadowEnabled?: boolean; canvasArtInnerShadowColor?: string; canvasArtInnerShadowBlur?: number
-  canvasArtInnerShadowOffsetX?: number; canvasArtInnerShadowOffsetY?: number; canvasArtInnerShadowOpacity?: number
-  canvasArtEmbossEnabled?: boolean; canvasArtEmbossAngle?: number; canvasArtEmbossIntensity?: number
-  canvasArtEmbossAmbient?: number; canvasArtEmbossHardness?: number; canvasArtEmbossBevel?: number
-}
-type LocalMask = { canvas: HTMLCanvasElement; width: number; height: number; margin: number }
-function createObjectAlphaMask(object: FabricObject, nativeRender: (this: FabricObject, ctx: CanvasRenderingContext2D) => void, blur: number, offsetX: number, offsetY: number, bevel = 0): LocalMask | null {
-  const scaleX = Math.max(0.01, object.scaleX || 1)
-  const scaleY = Math.max(0.01, object.scaleY || 1)
-  const width = Math.max(1, Math.ceil(object.width || object.getScaledWidth() / scaleX))
-  const height = Math.max(1, Math.ceil(object.height || object.getScaledHeight() / scaleY))
-  const margin = Math.ceil(blur * 2 + Math.max(Math.abs(offsetX), Math.abs(offsetY)) + bevel + 4)
-  const mask = document.createElement('canvas')
-  mask.width = width + margin * 2; mask.height = height + margin * 2
-  const maskContext = mask.getContext('2d')
-  if (!maskContext) return null
-  const original = { opacity: object.opacity, shadow: object.shadow }
-  try {
-    object.set({ opacity: 1, shadow: null } as never)
-    maskContext.translate(margin + width / 2, margin + height / 2)
-    nativeRender.call(object, maskContext)
-  } finally { object.set({ opacity: original.opacity, shadow: original.shadow } as never) }
-  maskContext.globalCompositeOperation = 'source-in'
-  maskContext.fillStyle = '#fff'; maskContext.fillRect(0, 0, mask.width, mask.height)
-  return { canvas: mask, width, height, margin }
-}
-function drawObjectInnerEdge(ctx: CanvasRenderingContext2D, mask: LocalMask, color: string, blur: number, offsetX: number, offsetY: number, opacity: number) {
-  const shifted = document.createElement('canvas')
-  shifted.width = mask.canvas.width; shifted.height = mask.canvas.height
-  const shiftedContext = shifted.getContext('2d')
-  if (!shiftedContext) return
-  shiftedContext.filter = blur ? `blur(${blur}px)` : 'none'
-  shiftedContext.drawImage(mask.canvas, offsetX, offsetY)
-  shiftedContext.filter = 'none'
-  const inner = document.createElement('canvas')
-  inner.width = mask.canvas.width; inner.height = mask.canvas.height
-  const innerContext = inner.getContext('2d')
-  if (!innerContext) return
-  innerContext.fillStyle = color; innerContext.fillRect(0, 0, inner.width, inner.height)
-  innerContext.globalCompositeOperation = 'destination-out'; innerContext.drawImage(shifted, 0, 0)
-  innerContext.globalCompositeOperation = 'destination-in'; innerContext.drawImage(mask.canvas, 0, 0)
-  ctx.save(); ctx.globalAlpha *= Math.max(0, Math.min(1, opacity))
-  ctx.drawImage(inner, -mask.width / 2 - mask.margin, -mask.height / 2 - mask.margin)
-  ctx.restore()
-}
-function renderStyledObject(object: FabricObject, ctx: CanvasRenderingContext2D, nativeRender: (this: FabricObject, ctx: CanvasRenderingContext2D) => void) {
-  const styled = object as StyledCanvasObject
-  if (!styled.canvasArtInnerShadowEnabled && !styled.canvasArtEmbossEnabled) { nativeRender.call(object, ctx); return }
-  const innerBlur = Math.max(0, Math.min(48, styled.canvasArtInnerShadowBlur || 0))
-  const innerX = Math.max(-80, Math.min(80, styled.canvasArtInnerShadowOffsetX || 0))
-  const innerY = Math.max(-80, Math.min(80, styled.canvasArtInnerShadowOffsetY || 0))
-  const bevel = Math.max(1, Math.min(24, styled.canvasArtEmbossBevel || 3))
-  const embossBlur = ((1 - Math.max(0, Math.min(1, styled.canvasArtEmbossHardness ?? 0.7))) * bevel) / 5
-  const mask = createObjectAlphaMask(object, nativeRender, Math.max(innerBlur, embossBlur), Math.max(Math.abs(innerX), bevel), Math.max(Math.abs(innerY), bevel), bevel)
-  nativeRender.call(object, ctx)
-  if (!mask) return
-  if (styled.canvasArtInnerShadowEnabled) drawObjectInnerEdge(ctx, mask, styled.canvasArtInnerShadowColor || '#202b47', innerBlur, innerX, innerY, styled.canvasArtInnerShadowOpacity ?? 0.7)
-  if (styled.canvasArtEmbossEnabled) {
-    const angle = (styled.canvasArtEmbossAngle ?? 45) * Math.PI / 180
-    const intensity = Math.max(0, Math.min(1, styled.canvasArtEmbossIntensity ?? 0.65))
-    const ambient = Math.max(0, Math.min(1, styled.canvasArtEmbossAmbient ?? 0.2))
-    const distance = bevel * 0.55
-    const dx = Math.cos(angle) * distance; const dy = Math.sin(angle) * distance
-    drawObjectInnerEdge(ctx, mask, '#ffffff', embossBlur, -dx, -dy, intensity * (1 - ambient * 0.35))
-    drawObjectInnerEdge(ctx, mask, '#111827', embossBlur, dx, dy, intensity * (0.45 + ambient * 0.35))
-  }
-}
-function installStyledObjectRenderers() {
-  const prototypes = [FabricImage.prototype, Rect.prototype, Circle.prototype, Ellipse.prototype, Triangle.prototype, Polygon.prototype, FabricPath.prototype]
-  for (const prototype of prototypes) {
-    const record = prototype as unknown as Record<string, unknown>
-    if (!Object.prototype.hasOwnProperty.call(record, '_render')) continue
-    const nativeRender = record._render as (this: FabricObject, ctx: CanvasRenderingContext2D) => void
-    record._render = function (this: FabricObject, ctx: CanvasRenderingContext2D) { renderStyledObject(this, ctx, nativeRender) }
-  }
-}
+FabricObject.customProperties = CANVAS_ART_CUSTOM_PROPERTIES
 installStyledObjectRenderers()
-
-function openDatabase(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1)
-    request.onupgradeneeded = () => request.result.createObjectStore(DB_STORE)
-    request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(request.error)
-  })
-}
-
-async function saveLocal(value: CanvasArtProject) {
-  const db = await openDatabase()
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(DB_STORE, 'readwrite')
-    tx.objectStore(DB_STORE).put(value, AUTOSAVE_ID)
-    tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error)
-  })
-  db.close()
-}
-
-async function readLocal(): Promise<CanvasArtProject | undefined> {
-  const db = await openDatabase()
-  const value = await new Promise<CanvasArtProject | undefined>((resolve, reject) => {
-    const request = db.transaction(DB_STORE).objectStore(DB_STORE).get(AUTOSAVE_ID)
-    request.onsuccess = () => {
-      try { resolve(request.result ? parseProject(request.result) : undefined) }
-      catch (error) { reject(error) }
-    }
-    request.onerror = () => reject(request.error)
-  })
-  db.close()
-  return value
-}
-
-function download(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob)
-  const anchor = document.createElement('a')
-  anchor.href = url
-  anchor.download = filename
-  anchor.click()
-  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
-}
-
-function readFileAsDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(String(reader.result))
-    reader.onerror = () => reject(reader.error || new Error('Gagal membaca file'))
-    reader.readAsDataURL(file)
-  })
-}
-
-async function installFontAssets(fonts: FontAsset[]): Promise<FontAsset[]> {
-  const installed: FontAsset[] = []
-  for (const font of fonts) {
-    try {
-      const face = new FontFace(font.family, `url("${font.dataUrl}")`)
-      await face.load()
-      document.fonts.add(face)
-      installed.push(font)
-    } catch (error) {
-      console.warn(`Font ${font.fileName} tidak dapat dimuat`, error)
-    }
-  }
-  return installed
-}
-
-function getObjectName(object: FabricObject, index: number) {
-  const candidate = object as FabricObject & { name?: string; id?: string }
-  return candidate.name || (object.type === 'i-text' || object.type === 'text' ? (object as FabricText).text.slice(0, 22) || 'Text' : `${object.type || 'Object'} ${index + 1}`)
-}
 
 function App() {
   const canvasElement = useRef<HTMLCanvasElement>(null)
@@ -623,16 +127,7 @@ function App() {
   const cameraRequestId = useRef(0)
   const [showSize, setShowSize] = useState(false)
   const [showQuotes, setShowQuotes] = useState(false)
-  const [quoteSearch, setQuoteSearch] = useState('')
-  const [quoteCategory, setQuoteCategory] = useState<'all' | QuoteCategory>('all')
-  const [quoteLanguage, setQuoteLanguage] = useState<'all' | QuoteLanguage>('all')
-  const [favoriteQuotes, setFavoriteQuotes] = useState<string[]>(() => {
-    try {
-      const parsed: unknown = JSON.parse(localStorage.getItem('canvasart-favorite-quotes-v1') || '[]')
-      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : []
-    } catch { return [] }
-  })
-  const [showFavoriteQuotesOnly, setShowFavoriteQuotesOnly] = useState(false)
+  const [showAbout, setShowAbout] = useState(false)
   const [showExport, setShowExport] = useState(false)
   const [showEmojiLibrary, setShowEmojiLibrary] = useState(false)
   const [emojiSearch, setEmojiSearch] = useState('')
@@ -1061,11 +556,6 @@ function App() {
     try { localStorage.setItem('canvasart-text-styles-v1', JSON.stringify(savedTextStyles)) }
     catch { setStatus('Gaya teks tidak dapat disimpan di penyimpanan browser') }
   }, [savedTextStyles])
-
-  useEffect(() => {
-    try { localStorage.setItem('canvasart-favorite-quotes-v1', JSON.stringify(favoriteQuotes)) }
-    catch { setStatus('Favorit kutipan tidak dapat disimpan di browser') }
-  }, [favoriteQuotes])
 
   useEffect(() => {
     try { localStorage.setItem('canvasart-sticker-favorites-v1', JSON.stringify(favoriteStickers)) }
@@ -2377,14 +1867,6 @@ function App() {
     const text = new FabricText(quote.text, { left: width * 0.12, top: canvas.getHeight() * 0.38, width: width * 0.76, fontFamily: 'Georgia', fontSize: Math.max(24, Math.min(54, Math.round(width * 0.045))), textAlign: 'center', fill: '#202b47', name: `Kutipan · ${quote.category}` } as never)
     canvas.add(text); canvas.setActiveObject(text); setShowQuotes(false); setActiveTab('Text'); syncObjects()
   }
-  const toggleQuoteFavorite = (id: string) => setFavoriteQuotes((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])
-  const visibleQuotes = QUOTES.filter((quote) => {
-    const query = quoteSearch.trim().toLocaleLowerCase(quote.language === 'id' ? 'id' : 'en')
-    return (quoteCategory === 'all' || quote.category === quoteCategory)
-      && (quoteLanguage === 'all' || quote.language === quoteLanguage)
-      && (!showFavoriteQuotesOnly || favoriteQuotes.includes(quote.id))
-      && (!query || quote.text.toLocaleLowerCase(quote.language === 'id' ? 'id' : 'en').includes(query))
-  })
   const resizeCanvas = (width: number, height: number) => {
     const canvas = editor.current
     if (!canvas || width < 16 || height < 16 || width > 8192 || height > 8192) return
@@ -2468,6 +1950,28 @@ function App() {
         event.preventDefault(); void keyboardActionsRef.current.copySelected()
       } else if (modifier && key === 'v') {
         event.preventDefault(); void keyboardActionsRef.current.pasteObject()
+      } else if (modifier && key === 'a') {
+        if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) {
+          event.preventDefault()
+          const canvas = editor.current
+          if (canvas) {
+            const selectables = canvas.getObjects().filter((obj) => obj.selectable !== false && obj.visible !== false)
+            if (selectables.length > 1) {
+              const selection = new ActiveSelection(selectables, { canvas })
+              canvas.setActiveObject(selection)
+              canvas.requestRenderAll()
+            } else if (selectables.length === 1) {
+              canvas.setActiveObject(selectables[0])
+              canvas.requestRenderAll()
+            }
+          }
+        }
+      } else if (key === 'escape') {
+        const canvas = editor.current
+        if (canvas) {
+          canvas.discardActiveObject()
+          canvas.requestRenderAll()
+        }
       } else if (key === 'delete' || key === 'backspace') {
         event.preventDefault(); keyboardActionsRef.current.deleteSelected()
       } else if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key)) {
@@ -2822,11 +2326,61 @@ function App() {
       </main>
 
       {showAddMenu && <div className="modal-backdrop" onClick={() => setShowAddMenu(false)}><div className="modal-card menu-modal" onClick={(e) => e.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">ELEMEN KANVAS</span><h2>Tambah elemen</h2></div><button onClick={() => setShowAddMenu(false)}>×</button></div><button className="menu-action" onClick={() => { setShowAddMenu(false); addText() }}>Teks baru</button><button className="menu-action" onClick={() => { setShowAddMenu(false); addDate() }}>Tanggal saat ini</button><button className="menu-action" onClick={() => { setShowAddMenu(false); setActiveTab('Object'); setShowEmojiLibrary(true) }}>Stiker & emoji</button><button className="menu-action" onClick={() => { setShowAddMenu(false); setActiveTab('Object'); addShape('rect') }}>Bentuk persegi</button><button className="menu-action" onClick={() => { setShowAddMenu(false); document.getElementById('import-image')?.click() }}>Impor gambar</button><button className="menu-action" onClick={() => { setShowAddMenu(false); openCamera('object') }}>Ambil foto sebagai objek</button><button className="menu-action" onClick={() => { setShowAddMenu(false); setActiveTab('Object'); setTool('draw') }}>Gambar dengan kuas</button></div></div>}
-      {showMenu && <div className="modal-backdrop" onClick={() => setShowMenu(false)}><div className="modal-card menu-modal" onClick={(e) => e.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">CANVASART</span><h2>Menu proyek</h2></div><button onClick={() => setShowMenu(false)}>×</button></div><button className="menu-action" onClick={() => document.getElementById('menu-background-image')?.click()}>Gunakan gambar sebagai latar</button><input id="menu-background-image" className="hidden-input" type="file" accept="image/*" onChange={(e) => { void chooseBackgroundImage(e.target.files?.[0]); e.currentTarget.value = '' }} /><button className="menu-action" onClick={() => { setShowMenu(false); openCamera('background') }}>Ambil gambar dari kamera</button><button className="menu-action" onClick={() => { setShowMenu(false); setShowSize(true) }}>Ukuran kanvas…</button><button className="menu-action" onClick={() => { setShowMenu(false); void restoreAutosave() }}>Pulihkan autosave</button><button className="menu-action" onClick={() => { setShowMenu(false); setShowQuotes(true) }}>Buka kutipan</button><div className="menu-note">Pemrosesan desain dilakukan lokal di browser.</div></div></div>}
-      {showCamera && <div className="modal-backdrop" onClick={() => setShowCamera(false)}><div className="modal-card camera-modal" onClick={(e) => e.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">KAMERA LOKAL</span><h2>{cameraTarget === 'background' ? 'Ambil foto untuk latar' : 'Ambil foto sebagai objek'}</h2></div><button onClick={() => setShowCamera(false)}>×</button></div><div className="camera-preview">{cameraActive ? <video ref={cameraVideo} autoPlay playsInline muted /> : <div><span>Pratinjau kamera akan muncul di sini.</span><button className="control-chip" onClick={() => void startCamera()}>Aktifkan kamera</button></div>}</div>{cameraError && <p className="camera-error" role="alert">{cameraError}</p>}<input id="camera-file" className="hidden-input" type="file" accept="image/*" capture="environment" onChange={(e) => { const file = e.target.files?.[0]; if (file) { if (cameraTarget === 'background') void chooseBackgroundImage(file); else void addImage(file); setShowCamera(false) } e.currentTarget.value = '' }} /><div className="camera-actions"><button className="quiet-btn" onClick={() => document.getElementById('camera-file')?.click()}>Pilih file</button>{cameraActive && <button className="primary-btn" onClick={() => void captureCameraImage()}>Ambil foto</button>}</div><small className="size-hint">Browser akan meminta izin kamera. Video hanya digunakan untuk mengambil foto di perangkat ini.</small></div></div>}
-      {showSize && <div className="modal-backdrop" onClick={() => setShowSize(false)}><div className="modal-card size-modal" onClick={(e) => e.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">DOKUMEN</span><h2>Ukuran kanvas</h2></div><button onClick={() => setShowSize(false)}>×</button></div><div className="size-presets">{[['Square',1080,1080],['Profile Picture',800,800],['YouTube Thumbnail',1280,720],['YouTube Channel Banner',2560,1440],['Facebook Cover Art',1640,624],['Google Header Image',2120,1192],['Twitter Header Size',1500,500]].map(([name,w,h]) => <button key={String(name)} className="control-chip" onClick={() => resizeCanvas(Number(w),Number(h))}>{name} · {w}×{h}</button>)}</div><div className="size-fields"><label>Lebar<input id="custom-width" type="number" min="16" max="8192" defaultValue={canvasWidth} /></label><label>Tinggi<input id="custom-height" type="number" min="16" max="8192" defaultValue={canvasHeight} /></label></div><label className="size-scale-option"><input type="checkbox" checked={scaleContentsOnResize} onChange={(e) => setScaleContentsOnResize(e.target.checked)} /> Skalakan posisi dan objek mengikuti ukuran baru</label><button className="primary-btn export-confirm" onClick={() => resizeCanvas(Number((document.getElementById('custom-width') as HTMLInputElement)?.value), Number((document.getElementById('custom-height') as HTMLInputElement)?.value))}>Terapkan ukuran</button><small className="size-hint">Maks. 8192 px per sisi. Pilih opsi di atas untuk ikut menskalakan isi desain.</small></div></div>}
-      {showQuotes && <div className="modal-backdrop" onClick={() => setShowQuotes(false)}><div className="modal-card quote-modal" onClick={(e) => e.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">PUSTAKA LOKAL · {QUOTES.length}</span><h2>Kutipan</h2></div><button onClick={() => setShowQuotes(false)}>×</button></div><p className="modal-intro">Pilih kutipan orisinal CanvasArt untuk menambahkannya sebagai teks yang bisa diedit.</p><input className="quote-search" type="search" value={quoteSearch} onChange={(e) => setQuoteSearch(e.target.value)} placeholder="Cari kutipan…" aria-label="Cari kutipan" /><div className="quote-filters"><select aria-label="Kategori kutipan" value={quoteCategory} onChange={(e) => setQuoteCategory(e.target.value as 'all' | QuoteCategory)}><option value="all">Semua kategori</option>{['Motivation','Success','Friendship','Happiness','Inspiration','Positivity','Absurd'].map((category) => <option key={category}>{category}</option>)}</select><select aria-label="Bahasa kutipan" value={quoteLanguage} onChange={(e) => setQuoteLanguage(e.target.value as 'all' | QuoteLanguage)}><option value="all">Semua bahasa</option><option value="id">Indonesia</option><option value="en">English</option></select><button className={`control-chip ${showFavoriteQuotesOnly ? 'chip-active' : ''}`} onClick={() => setShowFavoriteQuotesOnly(!showFavoriteQuotesOnly)}>★ Favorit</button></div><div className="quote-list">{visibleQuotes.map((quote) => <div className="quote-row" key={quote.id}><button className="quote-choice" onClick={() => addQuote(quote)}><span>“{quote.text}”</span><small>{quote.category} · {quote.language === 'id' ? 'Indonesia' : 'English'}</small></button><button className={`quote-favorite ${favoriteQuotes.includes(quote.id) ? 'is-favorite' : ''}`} aria-label={favoriteQuotes.includes(quote.id) ? 'Hapus dari favorit' : 'Tambahkan ke favorit'} title={favoriteQuotes.includes(quote.id) ? 'Hapus favorit' : 'Jadikan favorit'} onClick={() => toggleQuoteFavorite(quote.id)}>{favoriteQuotes.includes(quote.id) ? '★' : '☆'}</button></div>)}{visibleQuotes.length === 0 && <div className="quote-empty">Tidak ada kutipan yang cocok.</div>}</div></div></div>}
-      {showExport && <div className="modal-backdrop" onClick={() => setShowExport(false)}><div className="modal-card export-modal" onClick={(e) => e.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">SIMPAN HASIL</span><h2>Ekspor desain</h2></div><button onClick={() => setShowExport(false)}>×</button></div><label className="modal-label">Format<select value={exportFormat} onChange={(e) => setExportFormat(e.target.value as 'png' | 'jpeg')}><option value="png">PNG · transparan</option><option value="jpeg">JPEG · kualitas tinggi</option></select></label>{exportFormat === 'jpeg' && <label className="modal-label">Kualitas JPEG · {Math.round(exportJpegQuality * 100)}%<input type="range" min="0.3" max="1" step="0.05" value={exportJpegQuality} onChange={(e) => setExportJpegQuality(Number(e.target.value))} /></label>}<label className="modal-label">Ukuran<select value={exportScale} onChange={(e) => setExportScale(Number(e.target.value))}><option value="0.5">Low · {Math.round(canvasWidth * 0.5)} × {Math.round(canvasHeight * 0.5)} px</option><option value="0.75">Medium · {Math.round(canvasWidth * 0.75)} × {Math.round(canvasHeight * 0.75)} px</option><option value="1">High · {canvasWidth} × {canvasHeight} px</option><option value="1.5">Very High · {Math.round(canvasWidth * 1.5)} × {Math.round(canvasHeight * 1.5)} px</option><option value="2">Ultra · {canvasWidth * 2} × {canvasHeight * 2} px</option></select></label><label className="modal-label export-custom-toggle">Dimensi kustom<input type="checkbox" checked={exportCustomDimensions} onChange={(e) => setExportCustomDimensions(e.target.checked)} /></label>{exportCustomDimensions && <div className="size-fields"><label>Lebar keluaran<input type="number" min="16" max="8192" value={exportCustomWidth} onChange={(e) => setExportCustomWidth(Number(e.target.value) || 16)} onBlur={() => setExportCustomWidth((value) => Math.max(16, Math.min(8192, Math.round(value))))} /></label><label>Tinggi keluaran<input type="number" min="16" max="8192" value={exportCustomHeight} onChange={(e) => setExportCustomHeight(Number(e.target.value) || 16)} onBlur={() => setExportCustomHeight((value) => Math.max(16, Math.min(8192, Math.round(value))))} /></label></div>}<label className="modal-label">Penyesuaian isi<select value={exportFit} onChange={(e) => setExportFit(e.target.value as 'contain' | 'stretch')}><option value="contain">Pertahankan proporsi</option><option value="stretch">Penuhi ukuran keluaran</option></select></label><small className="size-hint">Mode pertahankan proporsi akan menyisakan ruang transparan di PNG atau putih di JPEG bila rasio ukuran berbeda.</small><div className="export-preview"><div className="preview-image-wrap">{exportPreviewUrl ? <img src={exportPreviewUrl} alt={`Preview ${projectName}`} /> : <span>{exportPreviewLoading ? 'Merender preview…' : exportPreviewError || 'Preview belum tersedia'}</span>}</div><div><b>{projectName}</b><small>{exportCustomDimensions ? `${Math.max(16, Math.min(8192, Math.round(exportCustomWidth)))} × ${Math.max(16, Math.min(8192, Math.round(exportCustomHeight)))}` : `${Math.round(canvasWidth * exportScale)} × ${Math.round(canvasHeight * exportScale)}`} px · {exportFormat.toUpperCase()}</small></div></div><div className="export-actions"><button className="quiet-btn" onClick={() => void exportImage(true)}>Bagikan</button><button className="primary-btn export-confirm" onClick={() => void exportImage()}>Unduh gambar</button></div></div></div>}
+      {showMenu && <div className="modal-backdrop" onClick={() => setShowMenu(false)}><div className="modal-card menu-modal" onClick={(e) => e.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">CANVASART</span><h2>Menu proyek</h2></div><button onClick={() => setShowMenu(false)}>×</button></div><button className="menu-action" onClick={() => document.getElementById('menu-background-image')?.click()}>Gunakan gambar sebagai latar</button><input id="menu-background-image" className="hidden-input" type="file" accept="image/*" onChange={(e) => { void chooseBackgroundImage(e.target.files?.[0]); e.currentTarget.value = '' }} /><button className="menu-action" onClick={() => { setShowMenu(false); openCamera('background') }}>Ambil gambar dari kamera</button><button className="menu-action" onClick={() => { setShowMenu(false); setShowSize(true) }}>Ukuran kanvas…</button><button className="menu-action" onClick={() => { setShowMenu(false); void restoreAutosave() }}>Pulihkan autosave</button><button className="menu-action" onClick={() => { setShowMenu(false); setShowQuotes(true) }}>Buka kutipan</button><button className="menu-action" onClick={() => { setShowMenu(false); setShowAbout(true) }}>Tentang CanvasArt</button><div className="menu-note">Pemrosesan desain dilakukan lokal di browser.</div></div></div>}
+      <CameraModal
+        show={showCamera}
+        cameraTarget={cameraTarget}
+        cameraActive={cameraActive}
+        cameraError={cameraError}
+        cameraVideoRef={cameraVideo}
+        onClose={() => setShowCamera(false)}
+        onStartCamera={() => void startCamera()}
+        onCapture={() => void captureCameraImage()}
+        onFileSelect={(file) => {
+          if (cameraTarget === 'background') void chooseBackgroundImage(file)
+          else void addImage(file)
+        }}
+      />
+      <CanvasSizeModal
+        show={showSize}
+        canvasWidth={canvasWidth}
+        canvasHeight={canvasHeight}
+        scaleContentsOnResize={scaleContentsOnResize}
+        setScaleContentsOnResize={setScaleContentsOnResize}
+        onClose={() => setShowSize(false)}
+        onResize={resizeCanvas}
+      />
+      <QuotesModal
+        show={showQuotes}
+        onClose={() => setShowQuotes(false)}
+        onAddQuote={addQuote}
+      />
+      <ExportModal
+        show={showExport}
+        onClose={() => setShowExport(false)}
+        projectName={projectName}
+        canvasWidth={canvasWidth}
+        canvasHeight={canvasHeight}
+        exportFormat={exportFormat}
+        setExportFormat={setExportFormat}
+        exportJpegQuality={exportJpegQuality}
+        setExportJpegQuality={setExportJpegQuality}
+        exportScale={exportScale}
+        setExportScale={setExportScale}
+        exportCustomDimensions={exportCustomDimensions}
+        setExportCustomDimensions={setExportCustomDimensions}
+        exportCustomWidth={exportCustomWidth}
+        setExportCustomWidth={setExportCustomWidth}
+        exportCustomHeight={exportCustomHeight}
+        setExportCustomHeight={setExportCustomHeight}
+        exportFit={exportFit}
+        setExportFit={setExportFit}
+        exportPreviewUrl={exportPreviewUrl}
+        exportPreviewLoading={exportPreviewLoading}
+        exportPreviewError={exportPreviewError}
+        onExport={(share) => void exportImage(share)}
+      />
+      <AboutModal show={showAbout} onClose={() => setShowAbout(false)} />
     </div>
   )
 }
